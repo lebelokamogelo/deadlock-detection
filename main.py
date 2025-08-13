@@ -17,8 +17,11 @@ class LogRecord:
     tid: Optional[str] = None
     res: Optional[str] = None
     details: Optional[str] = None
+    ts: float = field(default_factory=time.time)  # timestamp at creation
+
     def as_dict(self):
         return {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts)),
             "level": self.level,
             "event": self.event,
             "tid": self.tid,
@@ -37,14 +40,24 @@ class Logger:
         self.buffer: List[LogRecord] = []
         self.lock = threading.Lock()
         self.max_buffer_size = max_buffer_size  # None = unbounded
+        self.enabled = True  # pause/resume switch
 
-    def log(self, level: str, event: str, tid: Optional[str] = None, res: Optional[str] = None, details: Optional[str] = None):
+    def pause(self):
+        self.enabled = False
+
+    def resume(self):
+        self.enabled = True
+
+    def log(self, level: str, event: str, tid: Optional[str] = None, res: Optional[str] = None,
+            details: Optional[str] = None, *, force: bool = False):
+        # When paused, ignore logs unless force=True (so RESOLUTION can still be recorded)
+        if not self.enabled and not force:
+            return
         rec = LogRecord(level, event, tid, res, details)
         self.q.put(rec)
         with self.lock:
             self.buffer.append(rec)
             if self.max_buffer_size and len(self.buffer) > self.max_buffer_size:
-                # only trim if a size is explicitly set
                 self.buffer = self.buffer[-self.max_buffer_size:]
 
     def drain(self) -> List[LogRecord]:
@@ -160,7 +173,7 @@ class ResourceManager:
     def abort(self, tid: str):
         with self.cv:
             self.aborted.add(tid)
-            self.logger.log("ERROR", "TERMINATE", tid, details="victim termination")
+            self.logger.log("ERROR", "TERMINATE", tid, details="victim termination", force=True)
             # Purge from all wait queues
             for stt in self.resources.values():
                 try:
@@ -182,69 +195,72 @@ class DeadlockDetector(threading.Thread):
         self.interval = interval
         self.running = True
         self.on_deadlock = on_deadlock
+        self.total_deadlocks = 0
+        self.currently_in_deadlock = False  # prevent double counting the same cycle
 
     def run(self):
         while self.running:
             g = self.rm.build_wfg()
             try:
                 cyc = nx.find_cycle(g, orientation="original")
-                edges = [(u, v) for u, v, _ in cyc]
-                nodes = list({u for u, v in edges} | {v for u, v in edges})
-                self_waiters = [u for (u, v) in edges if u == v]
-                deadlock_type = "self-wait" if self_waiters else "cycle"
-                edge_details = [{"waiter": u, "holder": v, "resource": self.rm.edge_resource(u, v)} for (u, v) in edges]
-                self.logger.log("ERROR", "DEADLOCK_DETECTED", details=f"type={deadlock_type} cycle={'→'.join(nodes)}")
-                if self.on_deadlock:
-                    self.on_deadlock({
-                        "nodes": nodes,
-                        "edges": edges,
-                        "edge_details": edge_details,
-                        "deadlock_type": deadlock_type,
-                        "self_waiters": self_waiters
-                    })
+                # Only fire once per stuck period
+                if not self.currently_in_deadlock:
+                    edges = [(u, v) for u, v, _ in cyc]
+                    nodes = list({u for u, v in edges} | {v for u, v in edges})
+                    self_waiters = [u for (u, v) in edges if u == v]
+                    deadlock_type = "self-wait" if self_waiters else "cycle"
+                    edge_details = [{"waiter": u, "holder": v, "resource": self.rm.edge_resource(u, v)} for (u, v) in edges]
+                    self.logger.log(
+                        "ERROR",
+                        "DEADLOCK_DETECTED",
+                        tid=",".join(nodes),  # all threads in the cycle
+                        res=",".join(r for r in {e["resource"] for e in edge_details if e["resource"]}),
+                        details=f"type={deadlock_type} cycle={'→'.join(nodes)}"
+                    )
+                    self.total_deadlocks += 1
+                    self.currently_in_deadlock = True
+                    if self.on_deadlock:
+                        self.on_deadlock({
+                            "nodes": nodes,
+                            "edges": edges,
+                            "edge_details": edge_details,
+                            "deadlock_type": deadlock_type,
+                            "self_waiters": self_waiters
+                        })
             except nx.exception.NetworkXNoCycle:
+                # no change; we only clear the "currently_in_deadlock" when UI resolves
                 pass
             time.sleep(self.interval)
 
     # -------- Victim selection with explanation --------
     @staticmethod
     def _features_for(rm: ResourceManager, tid: str) -> dict:
-        # How many resources it holds
         holds = list(rm.held_by_thread.get(tid, set()))
         holds_count = len(holds)
-        # How many threads are waiting on resources it holds (how much we unblock)
         dependents = 0
         with rm.cv:
             for r in holds:
                 stt = rm.resources[r]
                 dependents += len(stt.wait_queue)
-        # How long this thread has been waiting (favor aborting newer waiters)
         ws = rm.waiting_since.get(tid)
         wait_age = 0.0 if ws is None else max(0.0, time.time() - ws)
         return {"holds_count": holds_count, "dependents": dependents, "wait_age": wait_age}
 
     @staticmethod
     def choose_victim_explained(rm: ResourceManager, candidates: List[str], policy: str = "min_cost") -> Tuple[str, dict]:
-        """
-        policy options:
-          - 'min_cost'      : abort fewest-held-resources (cheap rollback), tie-break by lowest wait_age then dependents
-          - 'max_unblock'   : abort the one that unblocks the most others (highest dependents), tie-break by holds then wait_age
-          - 'most_resources': current classic heuristic (holds_count desc), tie-break by dependents desc, then wait_age
-        Returns (victim_tid, explanation_dict)
-        """
         feats = {t: DeadlockDetector._features_for(rm, t) for t in candidates}
 
         def key_min_cost(t):
             f = feats[t]
-            return (f["holds_count"], f["wait_age"], f["dependents"])  # ascending
+            return (f["holds_count"], f["wait_age"], f["dependents"])
 
         def key_max_unblock(t):
             f = feats[t]
-            return (-f["dependents"], f["holds_count"], f["wait_age"])  # dependents desc
+            return (-f["dependents"], f["holds_count"], f["wait_age"])
 
         def key_most_resources(t):
             f = feats[t]
-            return (-f["holds_count"], -f["dependents"], f["wait_age"])  # holds desc
+            return (-f["holds_count"], -f["dependents"], f["wait_age"])
 
         if policy == "max_unblock":
             victim = sorted(candidates, key=key_max_unblock)[0]
@@ -274,7 +290,6 @@ class DeadlockDetector(threading.Thread):
         }
         return victim, exp
 
-    # Backwards-compatible method used elsewhere
     @staticmethod
     def choose_victim(rm: ResourceManager, candidates: List[str]) -> str:
         v, _ = DeadlockDetector.choose_victim_explained(rm, candidates, policy="most_resources")
@@ -304,26 +319,49 @@ class Worker(threading.Thread):
             self.rm.release_all(self.tid)
             time.sleep(random.uniform(0.1, 0.4))
 
+# ----------------------------- Resource Layout (fixed) ---------------------
+RESOURCE_LAYOUT = {
+    "DB": 3,
+    "FILE": 2,
+    "NET": 4,
+    "LOCK": 2,
+}
+def expand_resource_ids(layout: Dict[str, int]) -> List[str]:
+    ids: List[str] = []
+    for name, cap in layout.items():
+        for i in range(1, cap+1):
+            ids.append(f"{name}-{i}")
+    return ids
+
+# ----------------------------- Simulation wrapper -------------------------
 class Simulation:
-    def __init__(self, logger: Logger, threads=10, resources=6):
+    def __init__(self, logger: Logger, threads=10, resources=None):
         self.logger = logger
-        self.rm = ResourceManager([f"R{i}" for i in range(resources)], self.logger)
+        res_ids = expand_resource_ids(RESOURCE_LAYOUT)
+        self.rm = ResourceManager(res_ids, self.logger)
         self.workers: List[Worker] = [Worker(f"T{i}", self.rm, self.logger) for i in range(threads)]
         self.pending_deadlock: Optional[dict] = None
         self.suppress_deadlock_until: float = 0.0
+        self.resolved_count: int = 0  # number of user-resolved deadlocks
+
         def on_deadlock(info):
-            # Ignore detector events during the suppression window
+            # Ignore during suppression
             if time.time() < self.suppress_deadlock_until:
                 return
             self.pending_deadlock = info
+            # Pause logs immediately so overview stops counting after detection
+            self.logger.pause()
+
         self.detector = DeadlockDetector(self.rm, self.logger, on_deadlock=on_deadlock)
         self.running = False
+
     def start(self):
         if self.running: return
         self.running = True
         for w in self.workers: w.start()
         self.detector.start()
         self.logger.log("INFO", "SIM_START", details=f"threads={len(self.workers)} resources={len(self.rm.resources)}")
+
     def stop(self):
         if not self.running: return
         self.detector.running = False
@@ -332,6 +370,7 @@ class Simulation:
             self.rm.cv.notify_all()
         self.running = False
         self.logger.log("INFO", "SIM_STOP")
+
     def metrics(self):
         p = psutil.Process()
         return {
@@ -339,48 +378,49 @@ class Simulation:
             "mem_mb": p.memory_info().rss / (1024*1024),
             "threads_alive": sum(1 for w in self.workers if w.is_alive()),
             "resources": len(self.rm.resources),
+            "deadlocks_total": getattr(self.detector, "total_deadlocks", 0),
+            "deadlocks_resolved": self.resolved_count,
         }
 
-# ----------------------------- Streamlit UI -----------------------------
+# ----------------------------- Helpers for UI -----------------------------
 st.set_page_config(page_title="Real-Time Deadlock Simulator", layout="wide")
 
 if "last_resolved" not in st.session_state:
     st.session_state.last_resolved = None
 
-# Persist a single Logger across resets so logs aren't lost
 def get_logger() -> Logger:
     if "shared_logger" not in st.session_state:
-        # Default: unbounded buffer
         st.session_state.shared_logger = Logger(max_buffer_size=None)
     return st.session_state.shared_logger
 
 def get_sim() -> Simulation:
     if "sim" not in st.session_state:
-        st.session_state.sim = Simulation(logger=get_logger(), threads=10, resources=6)
+        st.session_state.sim = Simulation(logger=get_logger(), threads=10, resources=None)
     return st.session_state.sim
 
 def resource_snapshot(sim: Simulation):
     rm = sim.rm
     with rm.cv:
+        by_type = {k: {"total": v, "held": 0, "waiting": 0, "units": []} for k, v in RESOURCE_LAYOUT.items()}
         rows = []
-        free = in_use = waiting = 0
         for r_id, stt in rm.resources.items():
+            rtype = r_id.split("-")[0]
             holder = stt.holder or "-"
             q = list(stt.wait_queue)
-            qlen = len(q)
-            if stt.holder is None:
-                free += 1; left = 1
-            else:
-                in_use += 1; left = 0
-            waiting += qlen
-            rows.append({
-                "Resource": r_id,
-                "Holder": holder,
-                "Queue": ",".join(q) if q else "",
-                "Left": left,
-            })
-    totals = {"free": free, "in_use": in_use, "waiting": waiting, "total": len(rm.resources)}
-    return rows, totals
+            if stt.holder is not None:
+                by_type[rtype]["held"] += 1
+            by_type[rtype]["waiting"] += len(q)
+            by_type[rtype]["units"].append({"unit": r_id, "holder": holder, "queue": ",".join(q) if q else ""})
+            rows.append({"time": "", "level": "", "event": "", "Resource": r_id, "Holder": holder, "Queue": ",".join(q) if q else ""})
+        totals = {
+            name: {
+                "total": info["total"],
+                "held": info["held"],
+                "free": info["total"] - info["held"],
+                "waiting": info["waiting"],
+            } for name, info in by_type.items()
+        }
+    return rows, totals, by_type
 
 def victim_wait_info(sim: Simulation, victim_tid: str):
     rm = sim.rm
@@ -440,7 +480,7 @@ def last_events(sim: Simulation, limit: Optional[int] = None, only_cycle: Option
         rows = rows[-limit:]
     return rows
 
-# ----------------------------- UI: Controls -----------------------------
+# ----------------------------- Sidebar Controls ---------------------------
 st.sidebar.header("Controls")
 sim = get_sim()
 
@@ -453,11 +493,8 @@ with colB:
     if st.button("Stop", use_container_width=True):
         sim.stop()
 
-# Allow configuring thread/resource counts on reset
 threads = st.sidebar.slider("Threads", 2, 40, len(sim.workers), 1)
-resources = st.sidebar.slider("Resources", 2, 12, len(sim.rm.resources), 1)
 
-# Optional: let the user cap the buffer if desired (default None = unbounded)
 buf_cap = st.sidebar.selectbox("Log buffer cap", ["Unbounded", 5_000, 20_000, 100_000], index=0)
 if buf_cap != "Unbounded":
     get_logger().max_buffer_size = int(buf_cap)
@@ -465,24 +502,133 @@ else:
     get_logger().max_buffer_size = None
 
 if st.sidebar.button("Reset", use_container_width=True):
-    # Preserve the shared logger so logs persist across resets
     if sim.running:
         sim.stop()
-    st.session_state.sim = Simulation(logger=get_logger(), threads=threads, resources=resources)
+    cap = None if buf_cap == "Unbounded" else int(buf_cap)
+    st.session_state.shared_logger = Logger(max_buffer_size=cap)
+    st.session_state.sim = Simulation(
+        logger=st.session_state.shared_logger,
+        threads=threads,
+        resources=None
+    )
     sim = st.session_state.sim
+    st.session_state.last_resolved = None
+    sim.logger.log("INFO", "RESET", details=f"threads={threads} resources={len(sim.rm.resources)}", force=True)
 
-# --- Resources panel -------------------------------------------------------
-st.sidebar.markdown("### Resources")
-r_rows, r_tot = resource_snapshot(sim)
-c1, c2 = st.sidebar.columns(2)
-c1.metric("Free", r_tot["free"])
-c2.metric("In use", r_tot["in_use"])
-st.sidebar.metric("Waiting", r_tot["waiting"])
-st.sidebar.dataframe(r_rows, use_container_width=True, height=220)
+# ----------------------------- Overview + Simulation Tabs -----------------
+overview_tab, sim_tab = st.tabs(["Overview", "Simulation"])
 
+# ----------------------------- OVERVIEW -----------------------------------
+with overview_tab:
+    m = sim.metrics()
+    _, totals, _ = resource_snapshot(sim)
+
+    # Metrics (no timestamp card here; timestamps live in the log)
+    top1, top2, top3, top4 = st.columns(4)
+    with top1:
+        st.metric("Deadlocks Detected", f"{m['deadlocks_total']}")
+    with top2:
+        st.metric("Deadlocks Resolved", f"{m['deadlocks_resolved']}")
+    with top3:
+        st.metric("CPU", f"{m['cpu']:.0f}%")
+    with top4:
+        st.metric("Memory (MB)", f"{m['mem_mb']:.1f}")
+
+    # Current deadlock status
+    if sim.pending_deadlock:
+        st.error("Deadlock detected")
+    else:
+        st.info("Deadlock detected: None")
+
+    st.markdown("### Resources")
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    cols = [rc1, rc2, rc3, rc4]
+    idx = 0
+    for name in ["DB", "FILE", "NET", "LOCK"]:
+        c = cols[idx]; idx += 1
+        info = totals[name]
+        used = info["held"]; total = info["total"]; free = info["free"]; waiting = info["waiting"]
+        usage = (used / total) if total else 0.0
+        with c:
+            st.write(f"**{name}**")
+            st.progress(min(max(usage, 0.0), 1.0), text=f"Usage: {used}/{total}")
+            st.caption(f"Free: {free} | Waiting: {waiting}")
+
+    # Thread waiting / resources table
+    st.markdown("### Threads")
+    wait_rows = []
+    with sim.rm.cv:
+        for t, r in sim.rm.waiting_for.items():
+            if r:
+                holder = sim.rm.resources[r].holder
+                wait_rows.append({
+                    "Thread": t,
+                    "Waiting For": r,
+                    "Held By": holder or "-",
+                })
+    if wait_rows:
+        st.dataframe(wait_rows, use_container_width=True, height=240)
+    else:
+        st.caption("No threads are currently waiting.")
+
+# ----------------------------- SIMULATION ---------------------------------
+with sim_tab:
+    m = sim.metrics()
+    m1, m2, m4 = st.columns(3)
+    m1.metric("CPU", f"{m['cpu']:.0f}%")
+    m2.metric("Memory (MB)", f"{m['mem_mb']:.1f}")
+    m4.metric("Resources", f"{m['resources']}")
+
+    left, right = st.columns([2,1])
+
+    with left:
+        fig, ax = plt.subplots(figsize=(9, 6.5))
+        draw_wfg(sim, ax)
+        st.pyplot(fig, clear_figure=True)
+
+    with right:
+        st.subheader("System Log")
+
+        only_cycle = set(sim.pending_deadlock["nodes"]) if sim.pending_deadlock else None
+        show_cycle_only = st.checkbox("Show only processes in detected cycle", value=False)
+
+        row_choice = st.selectbox("Rows to show", ["All", 50, 200, 1000], index=0)
+        limit = None if row_choice == "All" else int(row_choice)
+
+        rows = last_events(sim, limit=limit, only_cycle=only_cycle if show_cycle_only else None)
+        st.dataframe(rows, use_container_width=True, height=420)
+
+        try:
+            import pandas as pd
+            with sim.logger.lock:
+                full_df = pd.DataFrame([r.as_dict() for r in sim.logger.buffer])
+            st.download_button(
+                "Download as CSV",
+                data=full_df.to_csv(index=False).encode(),
+                file_name="logs.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        except Exception:
+            pass
+
+        if sim.pending_deadlock:
+            st.subheader("Deadlock Explanation")
+            edetail = sim.pending_deadlock.get("edge_details", [])
+            deadlock_type = sim.pending_deadlock.get("deadlock_type", "cycle")
+            self_waiters = sim.pending_deadlock.get("self_waiters", [])
+            if deadlock_type == "self-wait":
+                st.markdown("**Type:** Self-wait (re-entrant request)**")
+                for w in self_waiters:
+                    r = next((e.get("resource") for e in edetail if e["waiter"] == w and e["holder"] == w), None)
+                    st.markdown(f"- **{w}** requested **{r or '(unknown)'}** which it already holds.")
+            else:
+                st.markdown("**Cycle edges**")
+                for e in edetail:
+                    st.markdown(f"- **{e['waiter']}** is waiting for **{e.get('resource') or '(unknown)'}** held by **{e['holder']}**")
+
+# ----------------------------- Deadlock sidebar actions --------------------
 st.sidebar.markdown("---")
-
-# Deadlock status messages (resolved vs detected) + victim policy
 if sim.pending_deadlock:
     st.sidebar.error("Deadlock detected!")
     edetail = sim.pending_deadlock.get("edge_details", [])
@@ -501,12 +647,10 @@ if sim.pending_deadlock:
         for e in edetail:
             st.sidebar.markdown(f"- **{e['waiter']}** → **{e.get('resource') or '(unknown)'}** → **{e['holder']}**")
 
-    # Victim policy selector + auto-pick with explanation
     policy = st.sidebar.selectbox("Victim policy", ["min_cost", "max_unblock", "most_resources"], index=0)
     best_victim, victim_exp = (DeadlockDetector.choose_victim_explained(sim.rm, victims, policy=policy)
                                if victims else (None, None))
 
-    # Allow manual override but default to auto-picked
     if victims:
         default_index = victims.index(best_victim) if best_victim in victims else 0
         victim = st.sidebar.selectbox("Victim", victims, index=default_index)
@@ -535,92 +679,30 @@ if sim.pending_deadlock:
 
     if st.sidebar.button("Resolve", use_container_width=True, type="primary"):
         chosen = victim if victim else best_victim
-        # Log the reasoning too
+        # Log termination & resolution even while paused
         sim.logger.log("ERROR", "RESOLUTION",
                        tid=chosen,
-                       details=f"terminate via UI; policy={policy}; explanation={victim_exp}")
+                       details=f"terminate via UI; policy={policy}; explanation={victim_exp}",
+                       force=True)
         sim.rm.abort(chosen)
+
+        # Mark resolved counts & clear deadlock status
         sim.pending_deadlock = None
+        sim.resolved_count += 1
+        sim.detector.currently_in_deadlock = False
+
         st.session_state.last_resolved = time.time()
+        # Resume logging now that the deadlock is resolved
+        sim.logger.resume()
         # Suppress fresh detector events briefly so UI shows 'resolved'
         sim.suppress_deadlock_until = time.time() + 2.0
 
 elif st.session_state.last_resolved:
-    # Show "Deadlock resolved" briefly, then clear
     st.sidebar.success("Deadlock resolved")
     if time.time() - st.session_state.last_resolved > 5:
         st.session_state.last_resolved = None
 
-# ----------------------------- Main area -----------------------------
-m = sim.metrics()
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("CPU", f"{m['cpu']:.0f}%")
-m2.metric("Memory (MB)", f"{m['mem_mb']:.1f}")
-m3.metric("Threads alive", f"{m['threads_alive']}")
-m4.metric("Resources", f"{m['resources']}")
-
-left, right = st.columns([2,1])
-
-with left:
-    fig, ax = plt.subplots(figsize=(9, 6.5))
-    draw_wfg(sim, ax)
-    st.pyplot(fig, clear_figure=True)
-
-with right:
-    st.subheader("System Log")
-
-    only_cycle = set(sim.pending_deadlock["nodes"]) if sim.pending_deadlock else None
-    # Default to showing EVERYTHING; user can opt into filtering
-    show_cycle_only = st.checkbox("Show only processes in detected cycle", value=False)
-
-    row_choice = st.selectbox("Rows to show", ["All", 50, 200, 1000], index=0)
-    limit = None if row_choice == "All" else int(row_choice)
-
-    rows = last_events(sim, limit=limit, only_cycle=only_cycle if show_cycle_only else None)
-    st.dataframe(rows, use_container_width=True, height=420)
-
-    # Download full buffer to avoid any loss
-    try:
-        import pandas as pd
-        with sim.logger.lock:
-            full_df = pd.DataFrame([r.as_dict() for r in sim.logger.buffer])
-        st.download_button(
-            "Download all logs (CSV)",
-            data=full_df.to_csv(index=False).encode(),
-            file_name="logs.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-    except Exception:
-        pass
-
-    if sim.pending_deadlock:
-        st.subheader("Deadlock Explanation")
-        edetail = sim.pending_deadlock.get("edge_details", [])
-        deadlock_type = sim.pending_deadlock.get("deadlock_type", "cycle")
-        self_waiters = sim.pending_deadlock.get("self_waiters", [])
-        nodes = sim.pending_deadlock.get("nodes", [])
-
-        if deadlock_type == "self-wait":
-            st.markdown("**Type:** Self-wait (re-entrant request)**")
-            for w in self_waiters:
-                r = next((e.get("resource") for e in edetail if e["waiter"] == w and e["holder"] == w), None)
-                st.markdown(f"- **{w}** requested **{r or '(unknown)'}** which it already holds.")
-        else:
-            st.markdown("**Cycle edges**")
-            for e in edetail:
-                st.markdown(f"- **{e['waiter']}** is waiting for **{e.get('resource') or '(unknown)'}** held by **{e['holder']}**")
-
-if sim.pending_deadlock:
-    pass
-
+# Main-loop tick
 if sim.running:
     time.sleep(1.0)
     st.rerun()
-
-
-# Show the Overview of the number of deadlocks happened
-# Show the Thread CPU Usage
-# Show the Memory Usage
-# Resources in detailed
-# Timestamp
