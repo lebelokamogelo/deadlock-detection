@@ -35,6 +35,14 @@ class ResourceState:
     wait_queue: Deque[str] = field(default_factory=deque)
 
 class Logger:
+    """
+    Thread-safe logger with buffering and pause/resume.
+
+    Maintains both a queue for real-time consumption and a circular buffer
+    for historical log viewing. Supports pausing to freeze log state during
+    deadlock analysis.
+    """
+
     def __init__(self, max_buffer_size: Optional[int] = None):
         self.q: queue.Queue[LogRecord] = queue.Queue()
         self.buffer: List[LogRecord] = []
@@ -67,11 +75,20 @@ class Logger:
         return drained
 
 class ResourceManager:
+    """
+    Thread-safe resource allocation manager with deadlock detection support.
+
+    Manages a pool of named resources, tracking which threads hold which resources
+    and maintaining wait queues. Builds wait-for graphs for deadlock detection
+    and supports thread termination for deadlock resolution.
+    """
     def __init__(self, resource_ids: List[str], logger: Logger):
         self.resources: Dict[str, ResourceState] = {r: ResourceState() for r in resource_ids}
         self.held_by_thread: Dict[str, Set[str]] = defaultdict(set)
         self.waiting_for: Dict[str, Optional[str]] = defaultdict(lambda: None)
         self.waiting_since: Dict[str, Optional[float]] = defaultdict(lambda: None)  # when a thread started waiting
+
+        # Synchronization and state management
         self.cv = threading.Condition()
         self.logger = logger
         self.aborted: Set[str] = set()
@@ -101,6 +118,7 @@ class ResourceManager:
     def acquire(self, resources: List[str], tid: str, shuffle=True):
         order = random.sample(resources, len(resources)) if shuffle else sorted(resources)
         for r in order:
+            # Randomize order to reduce likelihood of circular wait conditions
             while True:
                 if tid in self.aborted:
                     return False
@@ -171,6 +189,12 @@ class ResourceManager:
         return None
 
     def abort(self, tid: str):
+        """
+        Forcibly terminate a thread to resolve deadlocks.
+
+        Removes the thread from all wait queues, releases all held resources,
+        and marks it as aborted to prevent future resource requests.
+        """
         with self.cv:
             self.aborted.add(tid)
             self.logger.log("ERROR", "TERMINATE", tid, details="victim termination", force=True)
@@ -303,6 +327,16 @@ class Worker(threading.Thread):
         self.logger = logger
         self.running = True
     def run(self):
+        """
+        Main worker loop - request resources, work, release, repeat.
+
+        Each iteration:
+        1. Randomly selects 1-3 resources to request
+        2. Attempts to acquire all selected resources
+        3. Holds resources for random duration (0.5-1.5 seconds)
+        4. Releases all resources
+        5. Sleeps briefly before next iteration
+        """
         while self.running:
             all_res = list(self.rm.resources.keys())
             k = random.randint(1, min(3, len(all_res)))
@@ -319,7 +353,7 @@ class Worker(threading.Thread):
             self.rm.release_all(self.tid)
             time.sleep(random.uniform(0.1, 0.4))
 
-# ----------------------------- Resource Layout (fixed) ---------------------
+# ----------------------------- Resource Layout ---------------------
 RESOURCE_LAYOUT = {
     "DB": 3,
     "FILE": 2,
@@ -333,8 +367,15 @@ def expand_resource_ids(layout: Dict[str, int]) -> List[str]:
             ids.append(f"{name}-{i}")
     return ids
 
-# ----------------------------- Simulation wrapper -------------------------
+# ----------------------------- Simulation -------------------------
 class Simulation:
+    """
+    Main simulation orchestrator managing all system components.
+
+    Coordinates worker threads, resource management, deadlock detection,
+    and provides interfaces for system control and monitoring. Handles
+    the complete lifecycle from startup through deadlock resolution.
+    """
     def __init__(self, logger: Logger, threads=10, resources=None):
         self.logger = logger
         res_ids = expand_resource_ids(RESOURCE_LAYOUT)
@@ -345,6 +386,13 @@ class Simulation:
         self.resolved_count: int = 0  # number of user-resolved deadlocks
 
         def on_deadlock(info):
+            """
+            Callback invoked when deadlock detector finds a cycle.
+
+            Pauses logging to freeze system state for analysis and resolution.
+            Respects suppression periods to avoid duplicate notifications.
+            """
+
             # Ignore during suppression
             if time.time() < self.suppress_deadlock_until:
                 return
@@ -399,6 +447,14 @@ def get_sim() -> Simulation:
     return st.session_state.sim
 
 def resource_snapshot(sim: Simulation):
+    """
+    Capture comprehensive snapshot of current resource allocation state.
+
+    Analyzes all resources to determine usage patterns, wait queues,
+    and generates summary statistics by resource type for dashboard display.
+
+    """
+
     rm = sim.rm
     with rm.cv:
         by_type = {k: {"total": v, "held": 0, "waiting": 0, "units": []} for k, v in RESOURCE_LAYOUT.items()}
@@ -423,6 +479,14 @@ def resource_snapshot(sim: Simulation):
     return rows, totals, by_type
 
 def victim_wait_info(sim: Simulation, victim_tid: str):
+    """
+    Extract wait relationship details for a potential deadlock victim.
+
+    Determines what resource the victim thread is waiting for and which
+    thread currently holds that resource. Used for deadlock explanation
+    and resolution planning.
+
+    """
     rm = sim.rm
     with rm.cv:
         r = rm.waiting_for.get(victim_tid)
